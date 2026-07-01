@@ -2,8 +2,7 @@
  * This file is part of sp-smaps.
  *
  * Copyright (C) 2004-2007,2009,2011 Nokia Corporation.
- *
- * Contact: Eero Tamminen <eero.tamminen@nokia.com>
+ * Copyright (C) 2026 Jolla Mobile Ltd
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -54,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -61,6 +61,8 @@
 #include <dirent.h>
 #include <sched.h>
 #include <limits.h>
+#include <sys/mman.h>
+#include <sys/param.h>
 
 #define MSG_DISABLE_PROGRESS 0
 
@@ -77,6 +79,8 @@
 
 #define TOOL_NAME "sp_smaps_snapshot"
 #include "release.h"
+
+#define COMPACT_FORMAT_VERSION "1"
 
 /* ------------------------------------------------------------------------- *
  * Runtime Manual
@@ -117,13 +121,14 @@ static const manual_t app_man[]=
           "  result to 'after_boot.cap'.\n"
           )
   MAN_ADD("COPYRIGHT",
-          "Copyright (C) 2004-2007,2009,2011 Nokia Corporation.\n\n"
+          "Copyright (C) 2004-2007,2009,2011 Nokia Corporation.\n"
+          "Copyright (C) 2026 Jolla Mobile Ltd\n\n"
           "This is free software.  You may redistribute copies of it under the\n"
           "terms of the GNU General Public License v2 included with the software.\n"
           "There is NO WARRANTY, to the extent permitted by law.\n"
           )
   MAN_ADD("SEE ALSO",
-          "sp_smaps_filter (1)\n"
+          "sp_smaps_filter (1), sp_smaps_expand (1)\n"
           "\n"
           )
   MAN_END
@@ -144,6 +149,7 @@ enum
   opt_silent,
 
   opt_output,
+  opt_compact,
   opt_realtime,
 };
 
@@ -181,6 +187,12 @@ static const option_t app_opt[] =
           "o", "output", "<destination path>",
           "Output file to use instead of stdout.\n" ),
 
+  OPT_ADD(opt_compact,
+          "c", "compact", 0,
+          "Produce output in the compact format. Use the `sp_smaps_expand'\n"
+          "tool to convert the output from the compact format prior to\n"
+          "processing with other tools.\n" ),
+
   OPT_ADD(opt_realtime,
           "r", "realtime", 0,
           "Use realtime priority (needs to be run as root for this)" ),
@@ -201,6 +213,7 @@ static const option_t app_opt[] =
                          * file system block size. */
 
 static size_t page_size = 0;
+static uintptr_t page_size_mask = 0;
 static const char *outfile = 0;
 
 /* ========================================================================= *
@@ -399,6 +412,24 @@ static void output_fmt(const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------------- *
+ * output_line  --  queue one line for output
+ * ------------------------------------------------------------------------- */
+
+static const char *output_line(const char *data, const char *end)
+{
+  const char *line_end = memchr(data, '\n', end - data);
+
+  if( !line_end )
+  {
+    line_end = end - 1;
+  }
+
+  output_raw(data, line_end - data + 1);
+
+  return line_end + 1;
+}
+
+/* ------------------------------------------------------------------------- *
  * output_file  --  queue file contents to output
  * ------------------------------------------------------------------------- */
 
@@ -450,12 +481,11 @@ static ssize_t output_file(const char *path)
 }
 
 /* ------------------------------------------------------------------------- *
- * input_file  --  read file contents, terminate with '\0'
+ * input_file_head  --  read portion of file contents, terminate with '\0'
  * ------------------------------------------------------------------------- */
 
-static size_t input_file(const char *path, void *pdata, size_t *psize)
+static size_t input_file_head(const char *path, void *pdata, size_t *psize, size_t limit)
 {
-
   size_t  done = 0;
   char   *data = *(char **)pdata;
   size_t  size = *psize;
@@ -471,14 +501,14 @@ static size_t input_file(const char *path, void *pdata, size_t *psize)
   {
     if( size == 0 )
     {
-      if( (data = malloc((size = page_size))) == 0 )
+      if( (data = malloc((size = MIN(page_size, limit)))) == 0 )
       {
         msg_fatal("%s: %s\n", path, strerror(errno));
       }
     }
-    else if( size - done < page_size )
+    else if( (size < limit) && (size - done < page_size) )
     {
-      if( (data = realloc(data, (size *= 2))) == 0 )
+      if( (data = realloc(data, (size = MIN(size * 2, limit)))) == 0 )
       {
         msg_fatal("%s: %s\n", path, strerror(errno));
       }
@@ -529,6 +559,187 @@ static size_t input_file(const char *path, void *pdata, size_t *psize)
 
   return done;
 }
+
+/* ------------------------------------------------------------------------- *
+ * input_file  --  read file contents, terminate with '\0'
+ * ------------------------------------------------------------------------- */
+
+static size_t input_file(const char *path, void *pdata, size_t *psize)
+{
+  return input_file_head(path, pdata, psize, SIZE_MAX);
+}
+
+/* ========================================================================= *
+ * Sequential Input
+ * ========================================================================= */
+
+typedef struct scan_file_t
+{
+  const char *path;     /* File path */
+  const char *data;     /* The data read from the file, available in a sliding
+                           window. As the scan_file_advance() function is
+                           called, more data become available and previously
+                           consumed data get invalidated. */
+  const char *end;      /* Points one element after the data read so far, moving
+                           with scan_file_advance(). */
+
+  /* private */
+  int _fd;              /* File descriptor */
+  size_t _max_size;     /* Nuber of bytes reserved for the data */
+  int _eof;             /* EOF reached, 'end' is at its final position. */
+  uintptr_t _window;    /* Start of the window. */
+} scan_file_t;
+
+/* ------------------------------------------------------------------------- *
+ * scan_file_create
+ * ------------------------------------------------------------------------- */
+
+static scan_file_t *scan_file_create(const char *path, size_t max_size)
+{
+  scan_file_t *self = calloc(sizeof(scan_file_t), 1);
+  self->path = path;
+  self->_fd = -1;
+
+  void *addr = NULL;
+
+  if( (self->_fd = open(path, O_RDONLY)) == -1 )
+  {
+    msg_error("%s: %s\n", path, strerror(errno));
+    goto fail;
+  }
+
+  addr = mmap(NULL, max_size, PROT_NONE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+              -1, 0);
+  if( !addr )
+  {
+    msg_error("%s: %s\n", path, strerror(errno));
+    goto fail;
+  }
+
+  self->data = addr;
+  self->end = addr;
+  self->_window = (uintptr_t)addr;
+  self->_max_size = max_size;
+
+  return self;
+
+  fail:
+
+  if( self->_fd != -1 ) close(self->_fd);
+  free(self);
+  return NULL;
+}
+
+/* ------------------------------------------------------------------------- *
+ * scan_file_advance -- fetch more data from the file on demand
+ *
+ * Ensure that at least window_size bytes are available for processing unless
+ * EOF is reached. Reading happens in blocks of window_size.
+ *
+ * Indicate the progress of processing the data with 'pos'. Data before this
+ * point may become unavailable after this call. Do not try to read them again.
+ *
+ * On success, the number of bytes available for reading after this call is
+ * returned, computed as (self->end - pos). On error, -1 is returned.
+ * ------------------------------------------------------------------------- */
+
+static ssize_t scan_file_advance(scan_file_t *self,
+                                 const char *pos,
+                                 size_t window_size)
+{
+  if( !self->_eof && ((self->end - pos) < window_size) )
+  {
+    const uintptr_t end_aligned = (page_size_mask & (uintptr_t)self->end);
+    const size_t to_unlock = window_size + (size_t)(self->end - end_aligned);
+
+    if( mprotect((char *)end_aligned, to_unlock, PROT_READ | PROT_WRITE) != 0 )
+    {
+      msg_error("%s: mprotect: %s\n", self->path, strerror(errno));
+      return -1;
+    }
+
+    size_t to_read = window_size;
+    while( to_read > 0 )
+    {
+      ssize_t rc = read(self->_fd, (char *)self->end, to_read);
+
+      if( rc == 0 )
+      {
+        self->_eof = 1;
+        break;
+      }
+
+      if( rc == -1 )
+      {
+        switch( errno )
+        {
+        case EAGAIN:
+        case EINTR:
+          continue;
+
+        default:
+          perror("read");
+          return -1;
+        }
+      }
+
+      to_read -= (size_t)rc;
+      self->end += (size_t)rc;
+    }
+  }
+
+  const uintptr_t pos_aligned = (page_size_mask & (uintptr_t)pos);
+
+  if( self->_window < pos_aligned )
+  {
+    int rc = madvise((void*)self->_window,
+                     pos_aligned - self->_window,
+                     MADV_DONTNEED);
+
+    if( rc != 0 )
+    {
+      msg_warning("%s: madvise(MADV_DONTNEED): %s\n",
+                  self->path, strerror(errno));
+    }
+
+    self->_window = pos_aligned;
+  }
+
+  return self->end - pos;
+}
+
+/* ------------------------------------------------------------------------- *
+ * scan_file_delete
+ * ------------------------------------------------------------------------- */
+
+static void scan_file_delete(scan_file_t *self)
+{
+  if( !self )
+  {
+    return;
+  }
+
+  if( munmap((char *)self->data, self->_max_size) != 0 )
+  {
+    msg_warning("%s: munmap: %s\n", self->path, strerror(errno));
+  }
+
+  self->data = NULL;
+
+  if( close(self->_fd) != 0 )
+  {
+    msg_warning("%s: close: %s\n", self->path, strerror(errno));
+  }
+
+  self->_fd = -1;
+
+  free(self);
+}
+
+/* ========================================================================= *
+ * text parsing utilities
+ * ========================================================================= */
 
 #define uc(c) ((unsigned char)(c))
 #define wc(c) ((c)>0 && (c)<33)
@@ -677,10 +888,393 @@ static void check_kthreadd(const proc_pid_status_t *status)
 }
 
 /* ------------------------------------------------------------------------- *
+ * smaps fields
+ * ------------------------------------------------------------------------- */
+
+typedef struct field_t {
+    char *name;
+    int name_length;
+    char *unit;
+    int unit_length;
+} field_t;
+
+typedef struct fields_t
+{
+    field_t *fields;
+    int count;
+} fields_t;
+
+const char compact_process_fields_leader[] = "@";
+const char compact_segment_fields_leader[] = "!";
+
+const char compact_dir_name_key[] = "~DirName";
+const char compact_cmd_name_key[] = "~CmdName";
+
+const char compact_field_sep = '\x1F'; /* ASCII unit separator */
+const int compact_fields_max_size = 1 << 10;
+
+/*
+ * No smaps file can be greater than 100 MB...?
+ */
+static const size_t smaps_max_size = 100 << 20;
+
+/*
+ * Reading more than 3 kB from a smaps file (procfs in general) usually leads to
+ * partial reads. So an attempt to use e.g. window_size equal to page_size,
+ * assuming page_size of 4 kB, would lead to 2 reads in each scan_file_advance
+ * call.
+ */
+static const size_t smaps_window_size = 3 << 10;
+
+/* ------------------------------------------------------------------------- *
+ * fields_delete
+ * ------------------------------------------------------------------------- */
+
+void fields_delete(fields_t *fields)
+{
+  if( !fields )
+  {
+    return;
+  }
+
+  for( int i = 0; i < fields->count; ++i )
+  {
+    free(fields->fields[i].name);
+    free(fields->fields[i].unit);
+  }
+
+  free(fields->fields);
+  free(fields);
+}
+
+/* ------------------------------------------------------------------------- *
+ * parse_smaps_segment_fields - determine the fields from a sample file
+ * ------------------------------------------------------------------------- */
+
+fields_t *parse_smaps_segment_fields(const char *path)
+{
+  fields_t *self = calloc(sizeof(fields_t), 1);
+  char     *sample_text = 0;
+  size_t    sample_size = 0;
+  size_t    sample_limit = 4 << 10;
+
+  input_file_head(path, &sample_text, &sample_size, sample_limit);
+
+  char *sample = sample_text;
+
+  /* Skip first range header */
+  token(&sample, '\n');
+
+  while( *sample )
+  {
+    char *row = token(&sample, '\n');
+
+    /* Stop on next range header */
+    if( (*row >= '0' && *row <= '9') || (*row >= 'a' && *row <= 'f') )
+    {
+      break;
+    }
+
+    self->count++;
+    self->fields = reallocarray(self->fields, self->count, sizeof(field_t));
+
+    field_t *field = self->fields + self->count - 1;
+
+    char *key = token(&row, ':');
+    char *value = strip(row);
+    size_t value_length = strlen(value);
+
+    field->name = strdup(key);
+    field->name_length = strlen(key);
+
+    /* Assume no other than kB unit is possible */
+    if( value_length >= 4
+        && *value >= '0' && *value <= '9'
+        && *(value + value_length - 3) == ' '
+        && *(value + value_length - 2) == 'k'
+        && *(value + value_length - 1) == 'B' )
+    {
+      field->unit = strdup("kB");
+      field->unit_length = 2;
+    }
+    else
+    {
+      field->unit = strdup("");
+      field->unit_length = 0;
+    }
+  }
+
+  free(sample_text);
+
+  return self;
+}
+
+/* ------------------------------------------------------------------------- *
+ * output_compact_header -- output file header
+ * ------------------------------------------------------------------------- */
+
+static void output_compact_header(const fields_t *segment_fields)
+{
+  output_fmt("#smaps.ccap:%s\n", COMPACT_FORMAT_VERSION);
+
+  output_fmt("#%s", compact_process_fields_leader);
+  output_fmt("%c%s", compact_field_sep, compact_dir_name_key);
+  output_fmt("%c%s", compact_field_sep, compact_cmd_name_key);
+
+#define X(v) output_fmt("%c%s", compact_field_sep, #v);
+  X(Pid)
+  X(PPid)
+  X(Threads)
+  X(FDSize)
+  X(VmPeak)
+  X(VmSize)
+  X(VmLck)
+  X(VmHWM)
+  X(VmRSS)
+  X(VmData)
+  X(VmStk)
+  X(VmExe)
+  X(VmLib)
+  X(VmPTE)
+#undef X
+
+  output_fmt("\n");
+
+  output_fmt("#%s", compact_segment_fields_leader);
+
+  for( int i = 0; i < segment_fields->count; ++i )
+  {
+    const field_t *field = &segment_fields->fields[i];
+    output_fmt("%c%s:%s", compact_field_sep, field->name, field->unit);
+  }
+
+  output_fmt("\n");
+}
+
+/* ------------------------------------------------------------------------- *
+ * output_compact_fields -- output one block of fields in the compact format
+ *
+ * Returns position to continue from.
+ * ------------------------------------------------------------------------- */
+
+static const char *output_compact_fields(scan_file_t *file,
+                                         const char *start_pos,
+                                         const char *leader,
+                                         const fields_t *fields)
+{
+    const char *pos = start_pos;
+    const char *last_line_start = pos;
+
+    char buf[compact_fields_max_size];
+    char *buf_pos = buf;
+    char *const buf_end = buf + compact_fields_max_size;
+
+    buf_pos = stpncpy(buf_pos, leader, buf_end - buf_pos);
+
+    for( int i = 0; i < fields->count; ++i )
+    {
+      const field_t *const field = &fields->fields[i];
+
+      /*
+       * If we fail, we will dump the data as-is up to this point, return,
+       * and processing will continue from this point.
+       */
+      last_line_start = pos;
+
+      /*
+       * Consume the expected field name
+       */
+
+      if( strncmp(pos, field->name, MIN(field->name_length, file->end - pos)) != 0 )
+      {
+        char snip[64];
+        snprintf(snip, MIN(sizeof snip, file->end - pos), "%s", pos);
+        msg_warning("%s: Expected field '%s', got '%s...'\n",
+                    file->path, field->name, snip);
+        goto fail;
+      }
+
+      pos += field->name_length;
+
+      /*
+       * Consume the expected colon character
+       */
+
+      if( pos >= file->end )
+      {
+        msg_warning("%s: Expected ':', encountered EOF\n", file->path);
+        goto fail;
+      }
+
+      if( *pos != ':' )
+      {
+        char snip[64];
+        snprintf(snip, MIN(sizeof snip, file->end - pos), "%s", pos);
+        msg_warning("%s: Expected ':', got '%s...'\n", file->path, snip);
+        goto fail;
+      }
+
+      pos += 1;
+
+      /*
+       * Consume all spaces - seek to the start of the value string
+       */
+
+      while( pos < file->end && *pos == ' ' )
+        ++pos;
+
+      const char *value_start = pos;
+      const char *value_end = pos;
+
+      /*
+       * Seek to the end of line, check that the expected unit is there and
+       * reverse-find the end of the value string.
+       */
+
+      while( pos < file->end && *pos != '\n' )
+        ++pos;
+
+      if( field->unit_length != 0 )
+      {
+        if( strncmp(pos - field->unit_length, field->unit, field->unit_length) != 0 )
+        {
+          msg_warning("%s: Expected unit string '%s' for field '%s'\n",
+                      file->path, field->unit, field->name);
+          goto fail;
+        }
+        value_end = pos - field->unit_length - 1;
+      }
+      else
+      {
+        value_end = pos - 1;
+      }
+
+      while( *value_end == ' ' )
+        --value_end;
+      ++value_end; /* point one behind */
+
+      /*
+       * Append the field.
+       */
+
+      if( buf_pos + (value_end - value_start) + 1 >= buf_end )
+      {
+        msg_warning("%s: Buffer too small\n", file->path);
+        goto fail;
+      }
+
+      *buf_pos++ = compact_field_sep;
+      buf_pos = stpncpy(buf_pos, value_start, value_end - value_start);
+
+      /*
+       * Consume the line break
+       */
+
+      if( pos < file->end && *pos == '\n' )
+        ++pos;
+    }
+
+    if( buf_pos >= buf_end )
+    {
+      msg_warning("%s: No space for newline in buffer\n", file->path);
+      goto fail;
+    }
+
+    *buf_pos++ = '\n';
+
+    output_raw(buf, buf_pos - buf);
+    return pos;
+
+fail:
+    output_raw(start_pos, last_line_start - start_pos);
+    return last_line_start;
+}
+
+/* ------------------------------------------------------------------------- *
+ * output_compact_smaps -- output smaps file content in the compact format
+ *
+ * On success, returns the number of bytes read. On I/O error, returns -1. Does
+ * not indicate parsing errors. Content is passed through as is in case of
+ * parsing errors.
+ * ------------------------------------------------------------------------- */
+
+static ssize_t output_compact_smaps(scan_file_t *file,
+                                    const fields_t *segment_fields)
+{
+  const char *pos = file->data;
+  const char *last_line_start = pos;
+
+  while( pos < file->end )
+  {
+    if( scan_file_advance(file, pos, smaps_window_size) < 0 )
+    {
+      return -1;
+    };
+
+    last_line_start = pos;
+
+    if( (*pos >= 'a' && *pos <= 'f') || (*pos >= '0' && *pos <= '9') )
+    {
+      const char *line_end = memchr(pos, '\n', file->end - pos);
+
+      if( !line_end )
+      {
+        msg_warning("%s: unterminated line\n", file->path);
+        output_raw(pos, file->end - pos);
+        pos = file->end;
+        break;
+      }
+
+      output_raw(pos, line_end - pos + 1);
+
+      pos = line_end + 1;
+      pos = output_compact_fields(file, pos, compact_segment_fields_leader,
+                                  segment_fields);
+    }
+    else
+    {
+      pos = output_line(last_line_start, file->end);
+    }
+  }
+
+  return pos - file->data;
+}
+
+/* ------------------------------------------------------------------------- *
+ * output_compact_smaps_file -- output one smaps file in the compact format
+ *
+ * On success, returns the number of bytes read. On I/O error, returns -1. Does
+ * not indicate parsing errors. Content is passed through as is in case of
+ * parsing errors.
+ * ------------------------------------------------------------------------- */
+
+static ssize_t output_compact_smaps_file(const char *path,
+                                         const fields_t *segment_fields)
+{
+  scan_file_t *file = NULL;
+  ssize_t rc = -1;
+
+  file = scan_file_create(path, smaps_max_size);
+  if( !file )
+    goto cleanup;
+
+  rc = scan_file_advance(file, file->data, smaps_window_size);
+  if( rc == -1 )
+    goto cleanup;
+
+  rc = output_compact_smaps(file, segment_fields);
+
+  cleanup:
+
+  scan_file_delete(file);
+  return rc;
+}
+
+/* ------------------------------------------------------------------------- *
  * snapshot_all  -- retrieve snapshot of information for one process
  * ------------------------------------------------------------------------- */
 
-static int snapshot_all(void)
+static int snapshot_all(int compact)
 {
   char   *status_text = 0;
   size_t  status_size = 0;
@@ -688,6 +1282,8 @@ static int snapshot_all(void)
   size_t  cmdline_size = 0;
 
   static const char root[] = "/proc";
+
+  fields_t *segment_fields = 0;
 
   int  err = -1;
   DIR *dir = 0;
@@ -710,6 +1306,8 @@ static int snapshot_all(void)
       proc_pid_status_t status;
       size_t smaps_bytes;
       char *name = NULL;
+
+      ++cnt;
 
       /* - - - - - - - - - - - - - - - - - - - *
        * /proc/pid/exe -> link to executable
@@ -736,13 +1334,38 @@ static int snapshot_all(void)
 
       check_kthreadd(&status);
 
-      if( cnt++ != 0 )
+      if( cnt != 1 )
       {
         output_raw("\n",1);
       }
 
       snprintf(path, sizeof path, "%s/%s/smaps", root, de->d_name);
-      output_fmt("==> %s <==\n", path);
+
+      if( compact )
+      {
+        if( cnt == 1 )
+        {
+          if( strcmp(de->d_name, "1") != 0 )
+          {
+            msg_fatal("PID 1 expected first\n");
+          }
+
+          segment_fields = parse_smaps_segment_fields(path);
+          if( !segment_fields )
+          {
+            msg_fatal("Could not load fields\n");
+          }
+
+          output_compact_header(segment_fields);
+        }
+
+        output_fmt("%s%c%s", compact_process_fields_leader, compact_field_sep,
+                   de->d_name);
+      }
+      else
+      {
+        output_fmt("==> %s <==\n", path);
+      }
 
       name = strip(cmdline_text);
 
@@ -759,9 +1382,26 @@ static int snapshot_all(void)
         name = "unknown";
       }
 
-      output_fmt("#Name: %s\n", name);
+      if( compact )
+      {
+        output_fmt("%c%s", compact_field_sep, name);
+      }
+      else
+      {
+        output_fmt("#Name: %s\n", name);
+      }
 
-#define X(v) if( status.v ) output_fmt("#%s: %s\n",#v,status.v);
+#define X(v)                                                  \
+      if( compact )                                           \
+      {                                                       \
+        output_fmt("%c%s", compact_field_sep,                 \
+                   status.v ? status.v : "");                 \
+      }                                                       \
+      else                                                    \
+      {                                                       \
+        if( status.v ) output_fmt("#%s: %s\n", #v, status.v); \
+      }
+
       X(Pid)
       X(PPid)
       X(Threads)
@@ -776,9 +1416,17 @@ static int snapshot_all(void)
       X(VmExe)
       X(VmLib)
       X(VmPTE)
+
+      if( compact )
+      {
+        output_fmt("\n");
+      }
 #undef X
 
-      smaps_bytes = output_file(path);
+      smaps_bytes = compact
+        ? output_compact_smaps_file(path, segment_fields)
+        : output_file(path);
+
       if( smaps_bytes < 0 )
       {
         msg_warning("%s: read/write error\n", path);
@@ -815,6 +1463,7 @@ static int snapshot_all(void)
 int main(int ac, char **av)
 {
   argvec_t *args = argvec_create(ac, av, app_opt, app_man);
+  int compact = 0;
 
   while( !argvec_done(args) )
   {
@@ -850,6 +1499,9 @@ int main(int ac, char **av)
     case opt_output:
       outfile = par;
       break;
+    case opt_compact:
+      compact = 1;
+      break;
     case opt_realtime:
       if( geteuid() == 0 )
       {
@@ -873,5 +1525,7 @@ int main(int ac, char **av)
     msg_fatal("sysconf: %s\n", strerror(errno));
   }
 
-  return snapshot_all() ? EXIT_FAILURE : EXIT_SUCCESS;
+  page_size_mask = ~((uintptr_t)page_size - 1);
+
+  return snapshot_all(compact) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

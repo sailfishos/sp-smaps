@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+#
+# Convert SMAPS data in the compact format to the regular format.
+#
+# Copyright (C) 2026 Jolla Mobile Ltd
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# version 2 as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+# 02110-1301 USA
+
+import argparse
+import sys
+
+
+def error(msg):
+    print(msg, file=sys.stderr)
+
+
+class Fields:
+    def __init__(self, fields):
+        self.fields = fields
+
+    @staticmethod
+    def load(meta):
+        fields = []
+        for field in meta:
+            name, unit = (field.split(name_unit_sep) + [""])[:2]
+            fields.append((name, unit))
+
+        return Fields(fields)
+
+
+process_fields_leader = "@"
+segment_fields_leader = "!"
+
+field_sep = chr(31)  # ASCII unit separator
+name_unit_sep = ":"
+special_process_fields = {
+    "~DirName": "==> /proc/%s/smaps <==",
+    "~CmdName": "#Name: %s",
+}
+
+
+def expand_block(file, line, fields, line_prefix="", special_fields_format={}):
+    it = iter(line.split(field_sep))
+
+    next(it)  # skip mark
+
+    for name, unit in fields.fields:
+        try:
+            value = next(it)
+        except StopIteration:
+            error("Field '%s' missing" % name)
+            raise
+
+        if name and name[0] == "~":
+            special = special_fields_format[name]
+            if special:
+                print(special % value, file=file)
+                continue
+
+        if not value:
+            continue
+
+        if line_prefix:
+            print(line_prefix, end="", file=file)
+        if unit:
+            print(name + ":", value, unit, file=file)
+        else:
+            print(name + ":", value, file=file)
+
+
+def expand(ifile, ofile):
+    has_magic = False
+    process_fields = None
+    segment_fields = None
+
+    for line in ifile:
+        line = line.strip("\n")
+
+        if not has_magic:
+            if not line.startswith("#smaps.ccap:"):
+                error("Not a smaps.ccap file")
+                return False
+
+            split = line.split(":")
+
+            if len(split) < 2 or split[1] != "1":
+                error("Unsupported smaps.ccap format version")
+                return False
+
+            has_magic = True
+            continue
+
+        if not process_fields:
+            split = line.split(field_sep)
+            if len(split) < 2 or split[0] != "#@":
+                error("Expected process fields header, got %s" % repr(split))
+                return False
+
+            split.pop(0)
+
+            process_fields = Fields.load(split)
+            if not process_fields:
+                error("Failed to parse process fields header")
+                return False
+
+            continue
+
+        if not segment_fields:
+            split = line.split(field_sep)
+            if len(split) < 2 or split[0] != "#!":
+                error("Expected segment fields header, got %s" % repr(split))
+                return False
+
+            split.pop(0)
+
+            segment_fields = Fields.load(split)
+            if not segment_fields:
+                error("Failed to parse segment fields header")
+                return False
+
+            continue
+
+        if line.startswith(segment_fields_leader):
+            expand_block(ofile, line, segment_fields)
+        elif line.startswith(process_fields_leader):
+            expand_block(
+                ofile,
+                line,
+                process_fields,
+                line_prefix="#",
+                special_fields_format=special_process_fields,
+            )
+        else:
+            print(line, file=ofile)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert SMAPS data from the compact format",
+        add_help=False,
+    )
+    parser.add_argument(
+        "--help", "-h",
+        action="store_true",
+        help="Print this help message and exit",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print version and exit",
+    )
+    parser.add_argument(
+        "input",
+        default="-",
+        nargs="?",
+        help="Input file. Use stdin if omitted or '-' specified.",
+    )
+    parser.add_argument(
+        "output",
+        default="-",
+        nargs="?",
+        help="Output file. Use stdout if omitted or '-' specified.",
+    )
+
+    args = parser.parse_args()
+
+    if args.help:
+        # Make sp_gen_manfile happy a bit
+        print(parser.prog, "--", parser.description, "\n")
+        parser.description = ""
+        text = parser.format_help()
+        text = text.replace("usage: ", "synopsis:\n  ", 1)
+        print(text)
+        return
+
+    if args.version:
+        print("0.0.0")
+        return
+
+    if args.input == "-":
+        ifile = sys.stdin
+    else:
+        try:
+            ifile = open(args.input, "r")
+        except OSError as e:
+            parser.error(e)
+
+    if args.output == "-":
+        ofile = sys.stdout
+    else:
+        try:
+            ofile = open(args.output, "wt")
+        except OSError as e:
+            parser.error(e)
+
+    expand(ifile, ofile)
+
+
+if __name__ == "__main__":
+    main()

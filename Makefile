@@ -116,6 +116,7 @@ ALL_MEASURE += $(BIN_MEASURE) $(MAN_MEASURE)
 ## QUARANTINE BIN_VISUALIZE += sp_smaps_analyze
 ## QUARANTINE BIN_VISUALIZE += sp_smaps_diff
 
+BIN_VISUALIZE += sp_smaps_expand
 BIN_VISUALIZE += sp_smaps_filter
 
 LNK_VISUALIZE += sp_smaps_analyze

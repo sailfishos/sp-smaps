@@ -33,6 +33,7 @@ Man pages for %{name}.
 %{_bindir}/sp_smaps_analyze
 %{_bindir}/sp_smaps_appvals
 %{_bindir}/sp_smaps_diff
+%{_bindir}/sp_smaps_expand
 %{_bindir}/sp_smaps_filter
 %{_bindir}/sp_smaps_flatten
 %{_bindir}/sp_smaps_normalize
