@@ -469,9 +469,16 @@ static size_t input_file(const char *path, void *pdata, size_t *psize)
 
   for( ;; )
   {
-    if( size - done < page_size )
+    if( size == 0 )
     {
-      if( (data = realloc(data, (size += page_size))) == 0 )
+      if( (data = malloc((size = page_size))) == 0 )
+      {
+        msg_fatal("%s: %s\n", path, strerror(errno));
+      }
+    }
+    else if( size - done < page_size )
+    {
+      if( (data = realloc(data, (size *= 2))) == 0 )
       {
         msg_fatal("%s: %s\n", path, strerror(errno));
       }
