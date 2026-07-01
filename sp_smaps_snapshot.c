@@ -200,6 +200,7 @@ static const option_t app_opt[] =
                          * done in this sized blocks -> make it multiple of
                          * file system block size. */
 
+static size_t page_size = 0;
 static const char *outfile = 0;
 
 /* ========================================================================= *
@@ -468,9 +469,9 @@ static size_t input_file(const char *path, void *pdata, size_t *psize)
 
   for( ;; )
   {
-    if( size - done < 0x1000 )
+    if( size - done < page_size )
     {
-      if( (data = realloc(data, (size += 0x1000))) == 0 )
+      if( (data = realloc(data, (size += page_size))) == 0 )
       {
         msg_fatal("%s: %s\n", path, strerror(errno));
       }
@@ -858,6 +859,12 @@ int main(int ac, char **av)
   }
 
   argvec_delete(args);
+
+  page_size = sysconf(_SC_PAGESIZE);
+  if( page_size < 0 )
+  {
+    msg_fatal("sysconf: %s\n", strerror(errno));
+  }
 
   return snapshot_all() ? EXIT_FAILURE : EXIT_SUCCESS;
 }
