@@ -401,15 +401,16 @@ static void output_fmt(const char *fmt, ...)
  * output_file  --  queue file contents to output
  * ------------------------------------------------------------------------- */
 
-static size_t output_file(const char *path)
+static ssize_t output_file(const char *path)
 {
-  size_t cnt = 0;
+  ssize_t cnt = 0;
   char temp[RXBUFF];
   int file = open(path,O_RDONLY);
 
   if( file == -1 )
   {
     msg_error("%s: %s\n", path, strerror(errno));
+    cnt = -1;
     goto cleanup;
   }
 
@@ -432,6 +433,7 @@ static size_t output_file(const char *path)
 
       default:
         perror(path);
+        cnt = -1;
         goto cleanup;
       }
     }
@@ -769,6 +771,12 @@ static int snapshot_all(void)
 #undef X
 
       smaps_bytes = output_file(path);
+      if( smaps_bytes < 0 )
+      {
+        msg_warning("%s: read/write error\n", path);
+        continue;
+      }
+
       if (smaps_bytes == 0
           && !is_kthreadd(&status)
           && !is_kernel_thread(&status))
