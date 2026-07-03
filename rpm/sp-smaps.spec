@@ -18,6 +18,15 @@ Requires:  %{name} = %{version}-%{release}
 %description doc
 Man pages for %{name}.
 
+%package tests
+Summary:   Tests for %{name}
+BuildArch: noarch
+Requires:  %{name} = %{version}-%{release}
+Requires: blts-tools
+
+%description tests
+Tests for %{name}.
+
 %prep
 %autosetup -n %{name}-%{version}
 
@@ -53,3 +62,7 @@ Man pages for %{name}.
 %defattr(-,root,root,-)
 %doc README.txt
 %{_mandir}/man1/sp_smaps*
+
+%files tests
+%defattr(-,root,root,-)
+/opt/tests/%{name}/*
