@@ -151,6 +151,7 @@ enum
   opt_output,
   opt_compact,
   opt_realtime,
+  opt_root,
 };
 
 static const option_t app_opt[] =
@@ -196,6 +197,10 @@ static const option_t app_opt[] =
   OPT_ADD(opt_realtime,
           "r", "realtime", 0,
           "Use realtime priority (needs to be run as root for this)" ),
+
+  OPT_ADD(opt_root,
+          0, "root", "<procfs path>",
+          "Use nonstandard procfs location. For testing.\n" ),
 
   OPT_END
 };
@@ -1274,14 +1279,12 @@ static ssize_t output_compact_smaps_file(const char *path,
  * snapshot_all  -- retrieve snapshot of information for one process
  * ------------------------------------------------------------------------- */
 
-static int snapshot_all(int compact)
+static int snapshot_all(const char *root, int compact)
 {
   char   *status_text = 0;
   size_t  status_size = 0;
   char   *cmdline_text = 0;
   size_t  cmdline_size = 0;
-
-  static const char root[] = "/proc";
 
   fields_t *segment_fields = 0;
 
@@ -1364,7 +1367,7 @@ static int snapshot_all(int compact)
       }
       else
       {
-        output_fmt("==> %s <==\n", path);
+        output_fmt("==> /proc/%s/smaps <==\n", de->d_name);
       }
 
       name = strip(cmdline_text);
@@ -1464,6 +1467,7 @@ int main(int ac, char **av)
 {
   argvec_t *args = argvec_create(ac, av, app_opt, app_man);
   int compact = 0;
+  const char *root = "/proc";
 
   while( !argvec_done(args) )
   {
@@ -1514,6 +1518,9 @@ int main(int ac, char **av)
         exit(1);
       }
       break;
+    case opt_root:
+      root = par;
+      break;
     }
   }
 
@@ -1527,5 +1534,5 @@ int main(int ac, char **av)
 
   page_size_mask = ~((uintptr_t)page_size - 1);
 
-  return snapshot_all(compact) ? EXIT_FAILURE : EXIT_SUCCESS;
+  return snapshot_all(root, compact) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
