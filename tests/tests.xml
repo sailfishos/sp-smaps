@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testdefinition version="1.0">
+  <suite name="sp-smaps-tests" domain="qa">
+    <description>sp-smaps automatic tests</description>
+    <set name="compact-format" feature="sp-smaps">
+      <description>SMAPS data compact format tests</description>
+      <pre_steps>
+        <step>/usr/sbin/run-blts-root /opt/tests/sp-smaps/snapshot_procfs.sh procfs_snap</step>
+      </pre_steps>
+      <case manual="false" name="compact-format">
+        <step>/usr/sbin/run-blts-root /opt/tests/sp-smaps/test_compact.sh procfs_snap</step>
+      </case>
+      <post_steps>
+        <step>/usr/sbin/run-blts-root rm -rf procfs_snap</step>
+      </post_steps>
+    </set>
+  </suite>
+</testdefinition>

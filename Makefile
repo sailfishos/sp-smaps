@@ -64,6 +64,7 @@ PREFIX ?= /usr
 BIN    ?= $(PREFIX)/bin
 MAN1   ?= $(PREFIX)/share/man/man1
 DATA   ?= $(PREFIX)/share/sp-smaps-visualize
+TESTS  ?= /opt/tests/sp-smaps
 
 # -----------------------------------------------------------------------------
 # Common Compiler Options
@@ -116,6 +117,7 @@ ALL_MEASURE += $(BIN_MEASURE) $(MAN_MEASURE)
 ## QUARANTINE BIN_VISUALIZE += sp_smaps_analyze
 ## QUARANTINE BIN_VISUALIZE += sp_smaps_diff
 
+BIN_VISUALIZE += sp_smaps_expand
 BIN_VISUALIZE += sp_smaps_filter
 
 LNK_VISUALIZE += sp_smaps_analyze
@@ -143,7 +145,7 @@ ALL_TARGETS += $(ALL_MEASURE) $(ALL_NORMALIZE) $(ALL_VISUALIZE)
 
 build:: $(ALL_TARGETS)
 
-install:: install-measure install-visualize
+install:: install-measure install-visualize install-tests
 
 mostlyclean::
 	$(RM) *.o *~
@@ -244,6 +246,17 @@ install-visualize-data::
 	install -m644 data/asc.gif                     $(DESTDIR)$(DATA)/asc.gif
 	install -m644 data/desc.gif                    $(DESTDIR)$(DATA)/desc.gif
 	install -m644 data/bg.gif                      $(DESTDIR)$(DATA)/bg.gif
+
+# -----------------------------------------------------------------------------
+# Test Package Installation
+# -----------------------------------------------------------------------------
+
+install-tests::
+	install -m755 -d $(DESTDIR)$(TESTS)
+	install -m755 tests/snapshot_procfs.sh $(DESTDIR)$(TESTS)/snapshot_procfs.sh
+	install -m755 tests/test_compact.sh    $(DESTDIR)$(TESTS)/test_compact.sh
+	install -m644 tests/tests.xml          $(DESTDIR)$(TESTS)/tests.xml
+
 
 # -----------------------------------------------------------------------------
 # Target specific Rules

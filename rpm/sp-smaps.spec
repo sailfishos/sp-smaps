@@ -18,6 +18,15 @@ Requires:  %{name} = %{version}-%{release}
 %description doc
 Man pages for %{name}.
 
+%package tests
+Summary:   Tests for %{name}
+BuildArch: noarch
+Requires:  %{name} = %{version}-%{release}
+Requires: blts-tools
+
+%description tests
+Tests for %{name}.
+
 %prep
 %autosetup -n %{name}-%{version}
 
@@ -33,6 +42,7 @@ Man pages for %{name}.
 %{_bindir}/sp_smaps_analyze
 %{_bindir}/sp_smaps_appvals
 %{_bindir}/sp_smaps_diff
+%{_bindir}/sp_smaps_expand
 %{_bindir}/sp_smaps_filter
 %{_bindir}/sp_smaps_flatten
 %{_bindir}/sp_smaps_normalize
@@ -52,3 +62,7 @@ Man pages for %{name}.
 %defattr(-,root,root,-)
 %doc README.txt
 %{_mandir}/man1/sp_smaps*
+
+%files tests
+%defattr(-,root,root,-)
+/opt/tests/%{name}/*
