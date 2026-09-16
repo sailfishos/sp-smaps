@@ -44,7 +44,7 @@ trap 'cleanup' EXIT
 trap 'exit 1' INT TERM HUP
 
 TMP_DIR=$(mktemp -d "sp-smaps-test.XXXXX") || exit
-PROC_ROOT_COPY=$(mktemp -d "sp-smaps-test.XXXXX" --tmpdir) || exit
+PROC_ROOT_COPY=$(mktemp -t -d "sp-smaps-test.XXXXX") || exit
 
 if [ "$(stat --file-system --format="%T" "$PROC_ROOT_COPY")" != tmpfs ]; then
     echo "\$TMPDIR is not on 'tmpfs'." >&2
